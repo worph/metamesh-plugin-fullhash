@@ -1,6 +1,12 @@
 /**
  * Full Hash Plugin
- * Computes SHA-256 hash of the entire file
+ *
+ * Computes the SHA-256 hash of the entire file.
+ * This is a background queue plugin - it's slow but provides
+ * definitive content identification.
+ *
+ * Output:
+ * - cid_sha2-256: SHA-256 hash formatted as CID
  */
 
 import { createReadStream } from 'fs';
@@ -30,6 +36,9 @@ export const manifest: PluginManifest = {
     config: {},
 };
 
+/**
+ * Compute SHA-256 hash of a file using streaming
+ */
 async function computeSHA256(filePath: string): Promise<string> {
     return new Promise((resolve, reject) => {
         const hash = createHash('sha256');
@@ -52,6 +61,7 @@ export async function process(
 
         // Skip if already computed
         if (existingMeta?.['cid_sha2-256']) {
+            console.log(`[full-hash] SHA-256 already computed for ${filePath}, skipping`);
             await sendCallback({
                 taskId: request.taskId,
                 status: 'skipped',
@@ -61,16 +71,18 @@ export async function process(
             return;
         }
 
-        console.log(`[full-hash] Computing SHA-256 for ${filePath}`);
-        const sha256 = await computeSHA256(filePath);
+        console.log(`[full-hash] Computing SHA-256 hash for ${filePath}`);
 
-        // Format as CID-like string
-        const sha256Cid = `sha256-${sha256}`;
+        // Compute SHA-256 hash
+        const sha256Hex = await computeSHA256(filePath);
+
+        // Format as CID-like string (matching old format)
+        const sha256Cid = `sha256-${sha256Hex}`;
 
         await metaCore.setProperty(cid, 'cid_sha2-256', sha256Cid);
+        console.log(`[full-hash] SHA-256 computed: ${sha256Cid.substring(0, 20)}...`);
 
         const duration = Date.now() - startTime;
-        console.log(`[full-hash] Computed in ${duration}ms: ${sha256Cid.substring(0, 20)}...`);
 
         await sendCallback({
             taskId: request.taskId,
@@ -79,11 +91,14 @@ export async function process(
         });
     } catch (error) {
         const duration = Date.now() - startTime;
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`[full-hash] Error computing SHA-256 hash for ${request.filePath}:`, errorMessage);
+
         await sendCallback({
             taskId: request.taskId,
             status: 'failed',
             duration,
-            error: error instanceof Error ? error.message : String(error),
+            error: errorMessage,
         });
     }
 }
