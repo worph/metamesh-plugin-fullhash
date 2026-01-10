@@ -1,5 +1,5 @@
 # MetaMesh Plugin: full-hash
-# Computes SHA-256 hash of the entire file
+# Computes SHA-256 hash of the entire file with CSV caching
 
 FROM node:20-slim AS builder
 WORKDIR /app
