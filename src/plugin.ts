@@ -29,6 +29,15 @@ import { stringify } from 'csv-stringify/sync';
 import CRC32 from 'crc-32';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
+import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
+
+// Initialize WebDAV client if WEBDAV_URL is set
+const webdavClient = createWebDAVClient();
+if (webdavClient) {
+    console.log('[full-hash] Using WebDAV for file access');
+} else {
+    console.log('[full-hash] Using direct filesystem access');
+}
 
 // Cache folder path (mounted as /cache in container)
 const CACHE_FOLDER_PATH = globalThis.process.env.CACHE_PATH || '/cache';
@@ -203,9 +212,9 @@ function formatAsCid(hashType: HashAlgorithm, hashHex: string): string {
 }
 
 /**
- * Compute all hashes for a file in a single pass
+ * Compute all hashes for a file in a single pass (filesystem mode)
  */
-async function computeHashes(filePath: string, hashTypes: HashAlgorithm[]): Promise<Map<HashAlgorithm, string>> {
+async function computeHashesFromFilesystem(filePath: string, hashTypes: HashAlgorithm[]): Promise<Map<HashAlgorithm, string>> {
     return new Promise((resolve, reject) => {
         const results = new Map<HashAlgorithm, string>();
         const hashers: Map<HashAlgorithm, Hash> = new Map();
@@ -258,6 +267,67 @@ async function computeHashes(filePath: string, hashTypes: HashAlgorithm[]): Prom
 
         stream.on('error', reject);
     });
+}
+
+/**
+ * Compute all hashes for a file via WebDAV streaming
+ */
+async function computeHashesFromWebDAV(client: WebDAVClient, filePath: string, hashTypes: HashAlgorithm[]): Promise<Map<HashAlgorithm, string>> {
+    const results = new Map<HashAlgorithm, string>();
+    const hashers: Map<HashAlgorithm, Hash> = new Map();
+    let crc32Value = 0;
+    const needsCrc32 = hashTypes.includes('cid_crc32');
+
+    // Initialize crypto hashers
+    for (const hashType of hashTypes) {
+        const algo = HASH_ALGORITHMS[hashType];
+        if (algo.crypto) {
+            try {
+                hashers.set(hashType, createHash(algo.crypto));
+            } catch (e) {
+                console.warn(`[full-hash] Hash algorithm ${algo.crypto} not available, skipping ${hashType}`);
+            }
+        }
+    }
+
+    // Stream file from WebDAV
+    for await (const chunk of client.streamFile(filePath)) {
+        // Update all crypto hashers
+        for (const [, hasher] of hashers) {
+            hasher.update(chunk);
+        }
+        // Update CRC32
+        if (needsCrc32) {
+            crc32Value = CRC32.buf(chunk, crc32Value);
+        }
+    }
+
+    // Finalize crypto hashes
+    for (const [hashType, hasher] of hashers) {
+        const hexHash = hasher.digest('hex');
+        const cid = formatAsCid(hashType, hexHash);
+        results.set(hashType, cid);
+    }
+
+    // Finalize CRC32
+    if (needsCrc32) {
+        const unsigned = crc32Value >>> 0;
+        const hexHash = unsigned.toString(16).padStart(8, '0');
+        const cid = formatAsCid('cid_crc32', hexHash);
+        results.set('cid_crc32', cid);
+    }
+
+    return results;
+}
+
+/**
+ * Compute all hashes for a file in a single pass
+ */
+async function computeHashes(filePath: string, hashTypes: HashAlgorithm[]): Promise<Map<HashAlgorithm, string>> {
+    if (webdavClient) {
+        return computeHashesFromWebDAV(webdavClient, filePath, hashTypes);
+    }
+    return computeHashesFromFilesystem(filePath, hashTypes);
 }
 
 export const manifest: PluginManifest = {
@@ -345,9 +415,19 @@ export async function process(
         const hashesFromCache: Map<HashAlgorithm, string> = new Map();
 
         // Get file stats for cache lookup
-        const stats = await stat(filePath);
+        let fileSize: number;
+        let mtime: string;
         const filename = path.basename(filePath);
-        const mtime = stats.mtime.toISOString();
+
+        if (webdavClient) {
+            const stats = await webdavClient.stat(filePath);
+            fileSize = stats.size;
+            mtime = stats.mtime?.toISOString() || new Date().toISOString();
+        } else {
+            const stats = await stat(filePath);
+            fileSize = stats.size;
+            mtime = stats.mtime.toISOString();
+        }
 
         // Load caches and check what's needed
         for (const hashType of enabledHashes) {
@@ -360,7 +440,7 @@ export async function process(
             await loadHashCache(hashType);
 
             // Check cache
-            const cachedHash = getCachedHash(hashType, filename, stats.size, mtime);
+            const cachedHash = getCachedHash(hashType, filename, fileSize, mtime);
             if (cachedHash) {
                 hashesFromCache.set(hashType, cachedHash);
             } else {
@@ -388,7 +468,7 @@ export async function process(
 
             // Add computed hashes to cache
             for (const [hashType, hash] of computedHashes) {
-                addToCache(hashType, filename, stats.size, mtime, hash);
+                addToCache(hashType, filename, fileSize, mtime, hash);
             }
 
             // Save updated caches
@@ -407,7 +487,8 @@ export async function process(
 
         const cacheHits = hashesFromCache.size;
         const computed = computedHashes.size;
-        console.log(`[full-hash] Stored ${allHashes.size} hashes (${cacheHits} cached, ${computed} computed)`);
+        const mode = webdavClient ? 'WebDAV' : 'filesystem';
+        console.log(`[full-hash] Stored ${allHashes.size} hashes (${cacheHits} cached, ${computed} computed, ${mode})`);
 
         await sendCallback({
             taskId: request.taskId,
