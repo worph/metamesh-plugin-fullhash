@@ -1,19 +1,37 @@
-# MetaMesh Plugin: full-hash
-# Computes SHA-256 hash of the entire file with CSV caching
+# MetaMesh Plugin: full-hash (Rust)
+# High-performance file hashing with multi-algorithm support
 
-FROM node:20-slim AS builder
+FROM rust:1.83-slim AS builder
 WORKDIR /app
-COPY package.json tsconfig.json ./
-RUN npm install
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests and build dependencies first (for caching)
+COPY Cargo.toml ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+
+# Copy source and build
 COPY src/ ./src/
-RUN npm run build
+RUN touch src/main.rs && cargo build --release
 
-FROM node:20-slim
+FROM debian:bookworm-slim
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
-COPY --from=builder /app/dist ./dist
+
+# Install runtime dependencies (curl for healthcheck, ca-certificates for HTTPS)
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/metamesh-plugin-fast-full-hash /app/plugin
+
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:8080/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"
-CMD ["node", "dist/index.js"]
+  CMD curl -f http://localhost:8080/health || exit 1
+
+ENV RUST_LOG=info
+ENV CACHE_PATH=/cache
+
+# WebDAV URL for file access (set by container manager)
+# Example: http://meta-sort-dev/webdav
+ENV WEBDAV_URL=
+
+CMD ["/app/plugin"]

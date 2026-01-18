@@ -1,172 +1,256 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-const CACHE_VERSION: u32 = 1;
-const CACHE_FILENAME: &str = "hash_cache.bin";
+use crate::config::HashAlgorithm;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Cache entry for a single file
+#[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub filename: String,
     pub size: u64,
     pub mtime: i64,
-    pub hashes: HashMap<String, String>,
+    pub hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheIndex {
-    pub version: u32,
-    pub entries: HashMap<String, CacheEntry>,
+/// Per-algorithm CSV index manager
+///
+/// Each algorithm has its own CSV file: index-{algorithm}.csv
+/// Format: path,size,mtime,hash
+///
+/// Uses append-only writes for efficiency (like meta-hash does)
+struct AlgorithmIndex {
+    file_path: PathBuf,
+    /// In-memory cache: key = "filename|size|mtime", value = hash
+    entries: HashMap<String, String>,
+    /// Track which entries are new and need to be appended
+    pending_writes: Vec<CacheEntry>,
 }
 
-impl Default for CacheIndex {
-    fn default() -> Self {
+impl AlgorithmIndex {
+    fn new(cache_dir: &Path, algorithm: &str) -> Self {
+        let file_path = cache_dir.join(format!("index-{}.csv", algorithm));
         Self {
-            version: CACHE_VERSION,
+            file_path,
             entries: HashMap::new(),
+            pending_writes: Vec::new(),
         }
     }
-}
 
-impl CacheIndex {
-    /// Generate cache key from file metadata
-    pub fn make_key(filename: &str, size: u64, mtime: i64) -> String {
-        format!("{}-{}-{}", filename, size, mtime)
+    fn make_key(filename: &str, size: u64, mtime: i64) -> String {
+        format!("{}|{}|{}", filename, size, mtime)
     }
 
-    /// Get cached entry if it exists and matches file metadata
-    pub fn get(&self, filename: &str, size: u64, mtime: i64) -> Option<&CacheEntry> {
+    /// Load existing entries from CSV file
+    fn load(&mut self) -> Result<()> {
+        if !self.file_path.exists() {
+            return Ok(());
+        }
+
+        let file = File::open(&self.file_path)
+            .with_context(|| format!("Failed to open index file: {:?}", self.file_path))?;
+        let reader = BufReader::new(file);
+
+        let mut first_line = true;
+        for line in reader.lines() {
+            let line = line?;
+
+            // Skip header
+            if first_line {
+                first_line = false;
+                if line.starts_with("path,") {
+                    continue;
+                }
+            }
+
+            // Parse CSV line: path,size,mtime,hash
+            let parts: Vec<&str> = line.splitn(4, ',').collect();
+            if parts.len() == 4 {
+                let filename = parts[0].to_string();
+                let size: u64 = parts[1].parse().unwrap_or(0);
+                let mtime: i64 = parts[2].parse().unwrap_or(0);
+                let hash = parts[3].to_string();
+
+                let key = Self::make_key(&filename, size, mtime);
+                self.entries.insert(key, hash);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get cached hash for a file
+    fn get(&self, filename: &str, size: u64, mtime: i64) -> Option<&String> {
         let key = Self::make_key(filename, size, mtime);
         self.entries.get(&key)
     }
 
-    /// Insert or update a cache entry
-    pub fn insert(&mut self, filename: String, size: u64, mtime: i64, hashes: HashMap<String, String>) {
+    /// Add a hash to the cache (queues for append)
+    fn insert(&mut self, filename: String, size: u64, mtime: i64, hash: String) {
         let key = Self::make_key(&filename, size, mtime);
-        self.entries.insert(
-            key,
-            CacheEntry {
-                filename,
+
+        // Only queue for write if not already in cache
+        if !self.entries.contains_key(&key) {
+            self.pending_writes.push(CacheEntry {
+                filename: filename.clone(),
                 size,
                 mtime,
-                hashes,
-            },
-        );
+                hash: hash.clone(),
+            });
+            self.entries.insert(key, hash);
+        }
+    }
+
+    /// Append pending entries to CSV file
+    fn flush(&mut self) -> Result<()> {
+        if self.pending_writes.is_empty() {
+            return Ok(());
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Check if file exists to determine if we need a header
+        let needs_header = !self.file_path.exists() || fs::metadata(&self.file_path)?.len() == 0;
+
+        // Open file in append mode
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)?;
+
+        // Write header if needed
+        if needs_header {
+            writeln!(file, "path,size,mtime,hash")?;
+        }
+
+        // Append new entries
+        for entry in &self.pending_writes {
+            writeln!(file, "{},{},{},{}", entry.filename, entry.size, entry.mtime, entry.hash)?;
+        }
+
+        // Ensure data is flushed to disk
+        file.flush()?;
+        file.sync_all()?;
+
+        let count = self.pending_writes.len();
+        self.pending_writes.clear();
+
+        tracing::debug!("Appended {} entries to {:?}", count, self.file_path);
+
+        Ok(())
     }
 }
 
+/// Cache manager that handles multiple algorithm indexes
 pub struct CacheManager {
-    cache_path: PathBuf,
-    index: Arc<RwLock<CacheIndex>>,
+    cache_dir: PathBuf,
+    /// Per-algorithm indexes
+    indexes: Arc<RwLock<HashMap<String, AlgorithmIndex>>>,
+    /// Track which algorithms have been loaded
+    loaded: Arc<RwLock<HashSet<String>>>,
 }
 
 impl CacheManager {
     pub fn new(cache_dir: &str) -> Self {
-        let cache_path = PathBuf::from(cache_dir).join(CACHE_FILENAME);
         Self {
-            cache_path,
-            index: Arc::new(RwLock::new(CacheIndex::default())),
+            cache_dir: PathBuf::from(cache_dir),
+            indexes: Arc::new(RwLock::new(HashMap::new())),
+            loaded: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
-    /// Load cache from disk
+    /// Load all indexes (called at startup)
     pub async fn load(&self) -> Result<()> {
-        if !self.cache_path.exists() {
-            tracing::info!("No existing cache found at {:?}", self.cache_path);
+        // Load indexes for all known algorithms
+        for algo in HashAlgorithm::all() {
+            self.ensure_loaded(algo.key()).await?;
+        }
+        Ok(())
+    }
+
+    /// Ensure a specific algorithm's index is loaded
+    async fn ensure_loaded(&self, algorithm: &str) -> Result<()> {
+        let mut loaded = self.loaded.write().await;
+        if loaded.contains(algorithm) {
             return Ok(());
         }
 
-        let path = self.cache_path.clone();
-        let index = tokio::task::spawn_blocking(move || -> Result<CacheIndex> {
-            let file = File::open(&path).context("Failed to open cache file")?;
-            let reader = BufReader::new(file);
-            let index: CacheIndex =
-                bincode::deserialize_from(reader).context("Failed to deserialize cache")?;
+        let mut indexes = self.indexes.write().await;
+        let mut index = AlgorithmIndex::new(&self.cache_dir, algorithm);
 
-            // Version check
-            if index.version != CACHE_VERSION {
-                tracing::warn!(
-                    "Cache version mismatch (got {}, expected {}), starting fresh",
-                    index.version,
-                    CACHE_VERSION
-                );
-                return Ok(CacheIndex::default());
-            }
+        if let Err(e) = index.load() {
+            tracing::warn!("Failed to load index for {}: {}", algorithm, e);
+        } else {
+            tracing::info!("Loaded {} entries for {}", index.entries.len(), algorithm);
+        }
 
-            Ok(index)
-        })
-        .await??;
-
-        tracing::info!("Loaded {} cache entries", index.entries.len());
-        *self.index.write().await = index;
-        Ok(())
-    }
-
-    /// Save cache to disk atomically
-    pub async fn save(&self) -> Result<()> {
-        let index = self.index.read().await.clone();
-        let cache_path = self.cache_path.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            // Ensure parent directory exists
-            if let Some(parent) = cache_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Write to temp file first
-            let temp_path = cache_path.with_extension("tmp");
-            {
-                let file = File::create(&temp_path)?;
-                let writer = BufWriter::new(file);
-                bincode::serialize_into(writer, &index)?;
-            }
-
-            // Atomic rename
-            fs::rename(&temp_path, &cache_path)?;
-            Ok(())
-        })
-        .await??;
+        indexes.insert(algorithm.to_string(), index);
+        loaded.insert(algorithm.to_string());
 
         Ok(())
     }
 
-    /// Get cached hashes for a file
+    /// Get cached hashes for a file (returns all available hashes)
     pub async fn get(&self, filename: &str, size: u64, mtime: i64) -> Option<HashMap<String, String>> {
-        let index = self.index.read().await;
-        index.get(filename, size, mtime).map(|e| e.hashes.clone())
+        let indexes = self.indexes.read().await;
+        let mut results = HashMap::new();
+
+        for (algo, index) in indexes.iter() {
+            if let Some(hash) = index.get(filename, size, mtime) {
+                results.insert(algo.clone(), hash.clone());
+            }
+        }
+
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
     }
 
-    /// Store hashes in cache
+    /// Store hashes in cache (queues for append)
     pub async fn insert(&self, filename: String, size: u64, mtime: i64, hashes: HashMap<String, String>) {
-        let mut index = self.index.write().await;
-        index.insert(filename, size, mtime, hashes);
+        let mut indexes = self.indexes.write().await;
+
+        for (algo, hash) in hashes {
+            // Create index if it doesn't exist
+            if !indexes.contains_key(&algo) {
+                let mut index = AlgorithmIndex::new(&self.cache_dir, &algo);
+                let _ = index.load(); // Ignore errors, will create new file
+                indexes.insert(algo.clone(), index);
+            }
+
+            if let Some(index) = indexes.get_mut(&algo) {
+                index.insert(filename.clone(), size, mtime, hash);
+            }
+        }
     }
 
-    /// Get missing hash algorithms for a file (not in cache or not computed)
-    pub async fn get_missing_algos(
-        &self,
-        filename: &str,
-        size: u64,
-        mtime: i64,
-        required: &[&str],
-    ) -> Vec<String> {
-        let index = self.index.read().await;
-        let cached = index.get(filename, size, mtime);
+    /// Flush all pending writes to disk (MUST be called before reporting done)
+    pub async fn save(&self) -> Result<()> {
+        let mut indexes = self.indexes.write().await;
+        let mut total_written = 0;
 
-        required
-            .iter()
-            .filter(|algo| {
-                cached
-                    .map(|e| !e.hashes.contains_key(**algo))
-                    .unwrap_or(true)
-            })
-            .map(|s| s.to_string())
-            .collect()
+        for (algo, index) in indexes.iter_mut() {
+            let pending = index.pending_writes.len();
+            if pending > 0 {
+                index.flush().with_context(|| format!("Failed to flush index for {}", algo))?;
+                total_written += pending;
+            }
+        }
+
+        if total_written > 0 {
+            tracing::info!("Flushed {} total cache entries to disk", total_written);
+        }
+
+        Ok(())
     }
 }
 
@@ -176,25 +260,74 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_cache_roundtrip() {
+    async fn test_cache_append_mode() {
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path().to_str().unwrap());
 
-        // Insert some data
-        let mut hashes = HashMap::new();
-        hashes.insert("cid_sha2-256".to_string(), "baejbeitest".to_string());
-        cache
-            .insert("test.mkv".to_string(), 1000, 12345, hashes.clone())
-            .await;
-
-        // Save and reload
+        // Insert first entry
+        let mut hashes1 = HashMap::new();
+        hashes1.insert("cid_sha2-256".to_string(), "baejbeitest1".to_string());
+        cache.insert("test1.mkv".to_string(), 1000, 12345, hashes1).await;
         cache.save().await.unwrap();
 
-        let cache2 = CacheManager::new(temp_dir.path().to_str().unwrap());
-        cache2.load().await.unwrap();
+        // Insert second entry
+        let mut hashes2 = HashMap::new();
+        hashes2.insert("cid_sha2-256".to_string(), "baejbeitest2".to_string());
+        cache.insert("test2.mkv".to_string(), 2000, 12346, hashes2).await;
+        cache.save().await.unwrap();
 
-        let result = cache2.get("test.mkv", 1000, 12345).await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().get("cid_sha2-256").unwrap(), "baejbeitest");
+        // Verify file contents (should have header + 2 entries)
+        let csv_path = temp_dir.path().join("index-cid_sha2-256.csv");
+        let content = fs::read_to_string(&csv_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        assert_eq!(lines.len(), 3); // header + 2 entries
+        assert!(lines[0].starts_with("path,"));
+        assert!(lines[1].contains("test1.mkv"));
+        assert!(lines[2].contains("test2.mkv"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_reload() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // First cache instance
+        {
+            let cache = CacheManager::new(temp_dir.path().to_str().unwrap());
+            let mut hashes = HashMap::new();
+            hashes.insert("cid_sha2-256".to_string(), "baejbeitest".to_string());
+            cache.insert("test.mkv".to_string(), 1000, 12345, hashes).await;
+            cache.save().await.unwrap();
+        }
+
+        // Second cache instance (reload)
+        {
+            let cache = CacheManager::new(temp_dir.path().to_str().unwrap());
+            cache.load().await.unwrap();
+
+            let result = cache.get("test.mkv", 1000, 12345).await;
+            assert!(result.is_some());
+            assert_eq!(result.unwrap().get("cid_sha2-256").unwrap(), "baejbeitest");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_duplicate_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CacheManager::new(temp_dir.path().to_str().unwrap());
+
+        // Insert same entry twice
+        let mut hashes = HashMap::new();
+        hashes.insert("cid_sha2-256".to_string(), "baejbeitest".to_string());
+        cache.insert("test.mkv".to_string(), 1000, 12345, hashes.clone()).await;
+        cache.insert("test.mkv".to_string(), 1000, 12345, hashes).await;
+        cache.save().await.unwrap();
+
+        // Verify only one entry in file
+        let csv_path = temp_dir.path().join("index-cid_sha2-256.csv");
+        let content = fs::read_to_string(&csv_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        assert_eq!(lines.len(), 2); // header + 1 entry
     }
 }

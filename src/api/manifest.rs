@@ -21,8 +21,8 @@ pub struct ManifestResponse {
 
 pub async fn manifest() -> Json<ManifestResponse> {
     Json(ManifestResponse {
-        id: "fast-full-hash",
-        name: "Fast Full File Hash (Rust)",
+        id: "full-hash",
+        name: "Full File Hash",
         version: env!("CARGO_PKG_VERSION"),
         description: "High-performance parallel hashing with optimized I/O",
         author: "MetaMesh",

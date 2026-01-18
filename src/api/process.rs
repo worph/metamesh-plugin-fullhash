@@ -8,7 +8,8 @@ use std::time::Instant;
 use crate::cache::CacheManager;
 use crate::client::MetaCoreClient;
 use crate::config::{HashAlgorithm, SharedConfig};
-use crate::hasher::hash_file;
+use crate::hasher::{hash_bytes, hash_file};
+use crate::webdav::WebDavClient;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,32 +115,73 @@ enum ProcessResult {
     Skipped(String),
 }
 
+/// File source - either local filesystem or WebDAV
+enum FileSource {
+    Local {
+        path: std::path::PathBuf,
+        size: u64,
+        mtime: i64,
+    },
+    WebDav {
+        data: Vec<u8>,
+        size: u64,
+    },
+}
+
 async fn do_process_file(
     state: Arc<ProcessState>,
     req: ProcessRequest,
 ) -> anyhow::Result<ProcessResult> {
     let path = Path::new(&req.file_path);
 
-    // Check if file exists
-    if !path.exists() {
-        anyhow::bail!("File not found: {}", req.file_path);
-    }
-
-    // Get file metadata
-    let metadata = std::fs::metadata(path)?;
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
+    // Extract filename from path
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+
+    // Try to get file - either from local filesystem or WebDAV
+    let source = if path.exists() {
+        // Local file available
+        let metadata = std::fs::metadata(path)?;
+        let size = metadata.len();
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        tracing::debug!("Using local file: {}", req.file_path);
+        FileSource::Local {
+            path: path.to_path_buf(),
+            size,
+            mtime,
+        }
+    } else {
+        // Try WebDAV
+        let webdav_url = std::env::var("WEBDAV_URL")
+            .map_err(|_| anyhow::anyhow!("File not found locally and WEBDAV_URL not set: {}", req.file_path))?;
+
+        tracing::info!("Fetching via WebDAV: {}", req.file_path);
+        let client = WebDavClient::new(&webdav_url);
+        let reader = client.get_file(&req.file_path).await?;
+        let size = reader.size().unwrap_or(0);
+        let data = reader.bytes().await?;
+
+        tracing::info!("WebDAV fetch complete: {} bytes", data.len());
+        FileSource::WebDav {
+            data,
+            size,
+        }
+    };
+
+    // Get file size and mtime for cache lookup
+    let (size, mtime) = match &source {
+        FileSource::Local { size, mtime, .. } => (*size, *mtime),
+        FileSource::WebDav { size, .. } => (*size, 0), // No mtime for WebDAV
+    };
 
     // Get config
     let config = state.config.read().await.clone();
@@ -194,12 +236,20 @@ async fn do_process_file(
         );
 
         let enabled_set = to_compute.iter().copied().collect();
-        let computed = tokio::task::spawn_blocking({
-            let path = path.to_path_buf();
-            let buffer_size = config.buffer_size;
-            move || hash_file(&path, &enabled_set, buffer_size)
-        })
-        .await??;
+        let computed = match source {
+            FileSource::Local { path, .. } => {
+                // Use file-based hashing for local files
+                let buffer_size = config.buffer_size;
+                tokio::task::spawn_blocking(move || hash_file(&path, &enabled_set, buffer_size))
+                    .await??
+            }
+            FileSource::WebDav { data, .. } => {
+                // Use bytes-based hashing for WebDAV data
+                let filename_clone = filename.clone();
+                tokio::task::spawn_blocking(move || hash_bytes(&data, &filename_clone, &enabled_set))
+                    .await??
+            }
+        };
 
         // Merge computed hashes into results
         for (key, value) in &computed {
@@ -214,10 +264,11 @@ async fn do_process_file(
             .insert(filename.clone(), size, mtime, all_hashes)
             .await;
 
-        // Save cache periodically (could be optimized with debouncing)
-        if let Err(e) = state.cache.save().await {
-            tracing::warn!("Failed to save cache: {}", e);
-        }
+        // CRITICAL: Save cache to disk BEFORE reporting done
+        // This ensures the cache file is written and synced before the callback
+        state.cache.save().await?;
+
+        tracing::info!("Cache saved for {} ({} hashes)", filename, results.len());
     }
 
     // Store results to meta-core

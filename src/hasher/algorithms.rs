@@ -257,6 +257,137 @@ fn hash_file_single_pass(
     Ok((results, bt_leaf_hashes, file_size))
 }
 
+/// Hash data from bytes (for WebDAV streaming)
+///
+/// Similar to hash_file but works with in-memory data.
+/// Note: Midhash256 requires knowing file size and reading middle section,
+/// so we compute it from the bytes directly.
+pub fn hash_bytes(
+    data: &[u8],
+    filename: &str,
+    enabled: &HashSet<HashAlgorithm>,
+) -> Result<HashMap<String, String>> {
+    let mut results = HashMap::new();
+    let file_size = data.len() as u64;
+
+    // Check what we need to compute
+    let needs_bt = enabled.contains(&HashAlgorithm::BtPiecesRoot)
+        || enabled.contains(&HashAlgorithm::BtInfoHash);
+
+    // Initialize standard hashers
+    let mut sha256 = enabled.contains(&HashAlgorithm::Sha256).then(Sha256::new);
+    let mut sha1 = enabled.contains(&HashAlgorithm::Sha1).then(Sha1::new);
+    let mut md5 = enabled.contains(&HashAlgorithm::Md5).then(Md5::new);
+    let mut crc32 = enabled.contains(&HashAlgorithm::Crc32).then(crc32fast::Hasher::new);
+    let mut sha3_256 = enabled.contains(&HashAlgorithm::Sha3_256).then(Sha3_256::new);
+    let mut sha3_384 = enabled.contains(&HashAlgorithm::Sha3_384).then(Sha3_384::new);
+
+    // Process data in chunks for BT leaf hashes
+    let mut bt_leaf_hashes: Vec<[u8; 32]> = Vec::new();
+
+    // Update all hashers with full data
+    if let Some(ref mut h) = sha256 { h.update(data); }
+    if let Some(ref mut h) = sha1 { h.update(data); }
+    if let Some(ref mut h) = md5 { h.update(data); }
+    if let Some(ref mut h) = crc32 { h.update(data); }
+    if let Some(ref mut h) = sha3_256 { h.update(data); }
+    if let Some(ref mut h) = sha3_384 { h.update(data); }
+
+    // Compute BT leaf hashes
+    if needs_bt {
+        if file_size == 0 {
+            bt_leaf_hashes.push([0u8; 32]);
+        } else {
+            for chunk in data.chunks(BT_BLOCK_SIZE) {
+                let mut block = [0u8; BT_BLOCK_SIZE];
+                block[..chunk.len()].copy_from_slice(chunk);
+                // Pad with zeros if needed (last block)
+                let mut hasher = Sha256::new();
+                hasher.update(&block);
+                bt_leaf_hashes.push(hasher.finalize().into());
+            }
+        }
+
+        let pieces_root = compute_merkle_root(&bt_leaf_hashes);
+
+        if enabled.contains(&HashAlgorithm::BtPiecesRoot) {
+            results.insert(
+                HashAlgorithm::BtPiecesRoot.key().to_string(),
+                to_cid(&pieces_root, HashAlgorithm::BtPiecesRoot),
+            );
+        }
+
+        if enabled.contains(&HashAlgorithm::BtInfoHash) {
+            match compute_info_hash(filename, file_size, &pieces_root) {
+                Ok(info_hash) => {
+                    results.insert(
+                        HashAlgorithm::BtInfoHash.key().to_string(),
+                        to_cid(&info_hash, HashAlgorithm::BtInfoHash),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to compute BT info hash: {}", e);
+                }
+            }
+        }
+    }
+
+    // Midhash256 from bytes
+    if enabled.contains(&HashAlgorithm::Midhash256) {
+        let hash = compute_midhash256_from_bytes(data);
+        results.insert(
+            HashAlgorithm::Midhash256.key().to_string(),
+            to_cid(&hash, HashAlgorithm::Midhash256),
+        );
+    }
+
+    // Finalize standard hashes
+    if let Some(h) = sha256 {
+        results.insert(HashAlgorithm::Sha256.key().to_string(), to_cid(&h.finalize(), HashAlgorithm::Sha256));
+    }
+    if let Some(h) = sha1 {
+        results.insert(HashAlgorithm::Sha1.key().to_string(), to_cid(&h.finalize(), HashAlgorithm::Sha1));
+    }
+    if let Some(h) = md5 {
+        results.insert(HashAlgorithm::Md5.key().to_string(), to_cid(&h.finalize(), HashAlgorithm::Md5));
+    }
+    if let Some(h) = crc32 {
+        results.insert(HashAlgorithm::Crc32.key().to_string(), to_cid(&h.finalize().to_be_bytes(), HashAlgorithm::Crc32));
+    }
+    if let Some(h) = sha3_256 {
+        results.insert(HashAlgorithm::Sha3_256.key().to_string(), to_cid(&h.finalize(), HashAlgorithm::Sha3_256));
+    }
+    if let Some(h) = sha3_384 {
+        results.insert(HashAlgorithm::Sha3_384.key().to_string(), to_cid(&h.finalize(), HashAlgorithm::Sha3_384));
+    }
+
+    Ok(results)
+}
+
+/// Compute midhash256 from bytes (same algorithm as file version)
+fn compute_midhash256_from_bytes(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+
+    const SAMPLE_SIZE: usize = 1024 * 1024; // 1MB
+    let file_size = data.len();
+
+    let mut hasher = Sha256::new();
+
+    // Always include file size
+    hasher.update(file_size.to_le_bytes());
+
+    if file_size <= SAMPLE_SIZE {
+        // Small file: hash entire content
+        hasher.update(data);
+    } else {
+        // Large file: hash middle 1MB
+        let middle_start = (file_size - SAMPLE_SIZE) / 2;
+        hasher.update(&data[middle_start..middle_start + SAMPLE_SIZE]);
+    }
+
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

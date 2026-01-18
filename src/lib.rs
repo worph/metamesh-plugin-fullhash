@@ -7,3 +7,4 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub mod hasher;
+pub mod webdav;
