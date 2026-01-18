@@ -28,7 +28,7 @@ impl MetaCoreClient {
 
     /// Set a single property for a hash ID
     pub async fn set_property(&self, hash_id: &str, key: &str, value: &str) -> Result<()> {
-        let url = format!("{}/api/meta/{}/{}", self.base_url, hash_id, key);
+        let url = format!("{}/meta/{}/{}", self.base_url, hash_id, key);
 
         for attempt in 1..=MAX_RETRIES {
             match self
@@ -84,7 +84,7 @@ impl MetaCoreClient {
         metadata: &HashMap<String, String>,
     ) -> Result<()> {
         // Try batch endpoint first
-        let url = format!("{}/api/meta/{}", self.base_url, hash_id);
+        let url = format!("{}/meta/{}", self.base_url, hash_id);
 
         match self.client.patch(&url).json(metadata).send().await {
             Ok(resp) if resp.status().is_success() => {

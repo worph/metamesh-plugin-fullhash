@@ -20,7 +20,7 @@ pub struct ProcessRequest {
     pub callback_url: String,
     pub meta_core_url: String,
     #[serde(default)]
-    pub existing_meta: HashMap<String, String>,
+    pub existing_meta: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize)]
