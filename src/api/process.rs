@@ -8,8 +8,8 @@ use std::time::Instant;
 use crate::cache::CacheManager;
 use crate::client::MetaCoreClient;
 use crate::config::{HashAlgorithm, SharedConfig};
-use crate::hasher::{hash_bytes, hash_file};
-use crate::webdav::WebDavClient;
+use crate::hasher::{hash_file, hash_stream};
+use crate::webdav::{WebDavClient, WebDavReader};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +115,7 @@ enum ProcessResult {
     Skipped(String),
 }
 
-/// File source - either local filesystem or WebDAV
+/// File source - either local filesystem or WebDAV stream
 enum FileSource {
     Local {
         path: std::path::PathBuf,
@@ -123,8 +123,8 @@ enum FileSource {
         mtime: i64,
     },
     WebDav {
-        data: Vec<u8>,
-        size: u64,
+        reader: WebDavReader,
+        size: Option<u64>,
     },
 }
 
@@ -160,19 +160,18 @@ async fn do_process_file(
             mtime,
         }
     } else {
-        // Try WebDAV
+        // Try WebDAV - stream instead of loading into memory
         let webdav_url = std::env::var("WEBDAV_URL")
             .map_err(|_| anyhow::anyhow!("File not found locally and WEBDAV_URL not set: {}", req.file_path))?;
 
-        tracing::info!("Fetching via WebDAV: {}", req.file_path);
+        tracing::info!("Streaming via WebDAV: {}", req.file_path);
         let client = WebDavClient::new(&webdav_url);
         let reader = client.get_file(&req.file_path).await?;
-        let size = reader.size().unwrap_or(0);
-        let data = reader.bytes().await?;
+        let size = reader.size();
 
-        tracing::info!("WebDAV fetch complete: {} bytes", data.len());
+        tracing::info!("WebDAV stream ready, size: {:?}", size);
         FileSource::WebDav {
-            data,
+            reader,
             size,
         }
     };
@@ -180,7 +179,7 @@ async fn do_process_file(
     // Get file size and mtime for cache lookup
     let (size, mtime) = match &source {
         FileSource::Local { size, mtime, .. } => (*size, *mtime),
-        FileSource::WebDav { size, .. } => (*size, 0), // No mtime for WebDAV
+        FileSource::WebDav { size, .. } => (size.unwrap_or(0), 0), // No mtime for WebDAV
     };
 
     // Get config
@@ -243,11 +242,11 @@ async fn do_process_file(
                 tokio::task::spawn_blocking(move || hash_file(&path, &enabled_set, buffer_size))
                     .await??
             }
-            FileSource::WebDav { data, .. } => {
-                // Use bytes-based hashing for WebDAV data
+            FileSource::WebDav { reader, size: file_size } => {
+                // Use streaming hashing for WebDAV - process chunks as they arrive
+                let stream = reader.bytes_stream();
                 let filename_clone = filename.clone();
-                tokio::task::spawn_blocking(move || hash_bytes(&data, &filename_clone, &enabled_set))
-                    .await??
+                hash_stream(stream, &filename_clone, file_size, &enabled_set).await?
             }
         };
 

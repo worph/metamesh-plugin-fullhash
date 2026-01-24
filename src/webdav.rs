@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use futures_util::Stream;
 use reqwest::Client;
 
 /// WebDAV client for streaming file access
@@ -85,6 +87,12 @@ impl WebDavReader {
         self.inner.bytes().await
             .map(|b| b.to_vec())
             .context("Failed to read response bytes")
+    }
+
+    /// Get a stream of bytes for streaming processing
+    /// This is the efficient path - data is processed as it arrives
+    pub fn bytes_stream(self) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+        self.inner.bytes_stream()
     }
 
     /// Get the underlying response for streaming
