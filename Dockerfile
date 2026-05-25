@@ -1,19 +1,22 @@
 # MetaMesh Plugin: full-hash (Rust)
 # High-performance file hashing with multi-algorithm support
 
-FROM rust:1.83-slim AS builder
+FROM rust:1.89-slim-bookworm AS builder
 WORKDIR /app
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests and build dependencies first (for caching)
-COPY Cargo.toml ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+# Copy manifests and build dependencies first (for caching).
+# Cargo.lock is copied so the build uses the committed, reproducible
+# dependency set instead of re-resolving to the latest crates (which can
+# pull in versions requiring a newer Rust edition than this toolchain).
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release --locked && rm -rf src
 
 # Copy source and build
 COPY src/ ./src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim
 WORKDIR /app
