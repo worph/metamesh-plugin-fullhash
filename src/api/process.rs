@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::cache::CacheManager;
 use crate::client::MetaCoreClient;
 use crate::config::{HashAlgorithm, SharedConfig};
-use crate::hasher::{hash_file, hash_stream};
+use crate::hasher::{hash_file, hash_stream, multicodec_of};
 use crate::webdav::{WebDavClient, WebDavReader};
 
 #[derive(Deserialize)]
@@ -185,40 +185,48 @@ async fn do_process_file(
     // Get config
     let config = state.config.read().await.clone();
 
-    // Determine which hashes we need to compute
-    let required_keys: Vec<&str> = config
+    // Which digests does the record already carry? Sibling CIDs live as a
+    // bare-CID key-set (cids/<cid>); the algorithm is no longer in a field
+    // name, so we recover it from each member's multihash code. An algorithm
+    // is "already computed" iff its multicodec is present in that set.
+    let present_codecs: std::collections::HashSet<u64> = req
+        .existing_meta
+        .keys()
+        .filter_map(|k| k.strip_prefix("cids/"))
+        .filter_map(multicodec_of)
+        .collect();
+
+    let missing_algos: Vec<HashAlgorithm> = config
         .enabled_hashes
         .iter()
-        .map(|a| a.key())
-        .collect();
-
-    // Check existing metadata - skip if all hashes already present
-    let missing_from_meta: Vec<&str> = required_keys
-        .iter()
-        .filter(|k| !req.existing_meta.contains_key(**k))
         .copied()
+        .filter(|a| !present_codecs.contains(&a.multicodec()))
         .collect();
 
-    if missing_from_meta.is_empty() {
+    if missing_algos.is_empty() {
         return Ok(ProcessResult::Skipped(
             "All hashes already computed".to_string(),
         ));
     }
 
-    // Check cache for remaining hashes
+    // Check cache for remaining hashes. The internal results/cache maps stay
+    // keyed by the algorithm key (cid_sha2-256, …) — only the meta-core write
+    // below is transformed into the cids/<cid> key-set.
     let cached = state.cache.get(&filename, size, mtime).await;
     let mut results: HashMap<String, String> = HashMap::new();
 
-    let to_compute: Vec<HashAlgorithm> = missing_from_meta
+    let to_compute: Vec<HashAlgorithm> = missing_algos
         .iter()
-        .filter_map(|key| {
+        .copied()
+        .filter_map(|algo| {
+            let key = algo.key();
             if let Some(ref cached_hashes) = cached {
-                if let Some(hash) = cached_hashes.get(*key) {
+                if let Some(hash) = cached_hashes.get(key) {
                     results.insert(key.to_string(), hash.clone());
                     return None;
                 }
             }
-            HashAlgorithm::from_key(key)
+            Some(algo)
         })
         .collect();
 
@@ -270,11 +278,22 @@ async fn do_process_file(
         tracing::info!("Cache saved for {} ({} hashes)", filename, results.len());
     }
 
-    // Store results to meta-core
-    if !results.is_empty() {
+    // Store results to meta-core as the bare-CID key-set: one
+    // cids/<cid> = "true" entry per computed digest. The CID is
+    // self-describing (its algorithm is the multicodec), so there is no
+    // per-algorithm field name. The pieces-root is excluded — it's a
+    // torrent-internal merkle root, not a file-identity CID (§14.13).
+    let pieces_root_key = HashAlgorithm::BtPiecesRoot.key();
+    let cids_payload: HashMap<String, String> = results
+        .iter()
+        .filter(|(key, _)| key.as_str() != pieces_root_key)
+        .map(|(_, cid_value)| (format!("cids/{}", cid_value), "true".to_string()))
+        .collect();
+
+    if !cids_payload.is_empty() {
         match MetaCoreClient::new(&req.meta_core_url) {
             Ok(client) => {
-                if let Err(e) = client.merge_metadata(&req.cid, &results).await {
+                if let Err(e) = client.merge_metadata(&req.cid, &cids_payload).await {
                     tracing::warn!("Failed to store metadata to meta-core: {}", e);
                 }
             }

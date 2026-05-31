@@ -39,7 +39,14 @@ pub const MIDHASH256_CODE: u64 = 0x1000; // Custom, not in official registry
 
 // Official BitTorrent v2 code
 pub const BT_PIECES_ROOT_CODE: u64 = 0xb702; // Official bittorrent-pieces-root
-// BT info hash uses SHA256_CODE (0x12) since it's a SHA-256 hash
+
+// Custom BitTorrent v2 info-hash code (BEP 52), matching meta-hash's
+// cid_btih_v2. The info hash is a SHA-256 of the bencoded info dict, but it
+// MUST carry a distinct multihash code (not 0x12) so it can't be confused
+// with the full-file sha2-256 in the bare-CID key-set — see METADATA_KEYS.md
+// §2/§14.13. Consumers (meta-dup, meta-watch) disambiguate set members by
+// this code.
+pub const BTIH_V2_CODE: u64 = 0x10B7;
 
 impl HashAlgorithm {
     pub fn all() -> Vec<HashAlgorithm> {
@@ -125,7 +132,7 @@ impl HashAlgorithm {
             HashAlgorithm::Sha3_384 => SHA3_384_CODE,
             HashAlgorithm::Midhash256 => MIDHASH256_CODE,
             HashAlgorithm::BtPiecesRoot => BT_PIECES_ROOT_CODE,
-            HashAlgorithm::BtInfoHash => SHA256_CODE, // Info hash is SHA-256
+            HashAlgorithm::BtInfoHash => BTIH_V2_CODE, // distinct from sha2-256 (§14.13)
         }
     }
 }

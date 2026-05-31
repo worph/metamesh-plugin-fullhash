@@ -84,13 +84,20 @@ pub async fn manifest() -> Json<ManifestResponse> {
                 "label": "BitTorrent v2 Info Hash",
                 "type": "cid",
                 "readonly": true,
-                "hint": "SHA-256 of bencoded info dict for magnet links (multicodec 0x12)"
+                "hint": "BitTorrent v2 info hash: SHA-256 of bencoded info dict (btih-v2 multicodec 0x10B7)"
             }
         }),
         config: json!({
             "enabledHashes": {
                 "type": "string",
                 "label": "Enabled hash algorithms (comma-separated)",
+                // These keys select WHICH digests to compute — they are an
+                // internal algorithm-selection vocabulary, NOT record field
+                // names. Results are stored on the record as a bare-CID
+                // key-set (cids/<cid> = "true"); the algorithm is recovered
+                // from each CID's multicodec, never a field name. The
+                // pieces-root is computed but not stored as a file-identity
+                // member (METADATA_KEYS.md §14.13).
                 "default": "cid_sha2-256,cid_sha1,cid_md5,cid_crc32,cid_sha3-256,cid_sha3-384,cid_midhash256,cid_bt_pieces_root,cid_bt_info_hash",
                 "required": false
             }

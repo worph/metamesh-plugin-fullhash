@@ -30,6 +30,14 @@ pub fn to_cid(hash: &[u8], algo: HashAlgorithm) -> String {
     cid.to_string()
 }
 
+/// Returns the multihash code (the algorithm) of a bare CID string, or None
+/// if it doesn't parse. Used to tell which digests a record already carries
+/// in its bare-CID key-set (cids/<cid>), since the algorithm is no longer in
+/// a field name.
+pub fn multicodec_of(cid_str: &str) -> Option<u64> {
+    Cid::try_from(cid_str).ok().map(|c| c.hash().code())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
