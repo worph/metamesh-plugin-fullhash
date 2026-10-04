@@ -59,6 +59,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting fast-full-hash plugin on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // Beacon v2: findable by meta-sort's Plugins page (Scan → Add). Advertises
+    // BEACON_ADVERTISE_URL (default http://$HOSTNAME:<port>) and honours
+    // BEACON_BINDS, which meta-sort sets on the containers it spawns.
+    let _beacon = {
+        use meta_feeder_sdk::beacon::{advertise_plugin, advertise_url, binds_from_env, caps, Resource};
+        advertise_plugin("metamesh-plugin-full-hash", env!("CARGO_PKG_VERSION"), move || {
+            let mut r = Resource::new("full-hash", [caps::enrich("full-hash")])
+                .with_endpoint("http", advertise_url(port))
+                .with_endpoint("manifest", "/manifest");
+            r.binds = binds_from_env();
+            r
+        })
+    };
+
     axum::serve(listener, app).await?;
 
     Ok(())

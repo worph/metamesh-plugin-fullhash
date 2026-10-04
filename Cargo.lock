@@ -803,8 +803,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
+name = "meta-feeder-sdk"
+version = "1.7.0"
+source = "git+https://github.com/worph/meta-feeder-sdk?tag=v1.7.0#027917c8cffe7ca43dadcf3b426cc5f69ecc443a"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "metamesh-plugin-fast-full-hash"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -815,6 +827,7 @@ dependencies = [
  "futures-util",
  "hex",
  "md-5",
+ "meta-feeder-sdk",
  "multihash",
  "reqwest",
  "serde",
